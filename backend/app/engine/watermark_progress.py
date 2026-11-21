@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+from typing import Any
 
 
 class WatermarkStatus(str, Enum):
@@ -153,26 +154,64 @@ class WatermarkEngine:
                               "yellow" if severe < total * 0.1 else "red",
         }
 
+    def compute_missing_partitions(
+        self,
+        record: WatermarkRecord,
+        expected_watermark: str | None = None,
+        confirmed_partitions: set[str] | None = None,
+    ) -> list[str]:
+        """依据有效进度计算实际缺失分区。
+
+        枚举当前水位（不含）到期望水位（含）之间的全部日分区，
+        再剔除进度回执中已确认有产物的分区，得到真正需要补偿的缺口。
+        """
+        now = datetime.now()
+        expected_str = expected_watermark or self._expected_watermark(
+            record.scheduled_time, now
+        ).strftime(record.partition_format)
+        candidates = self._enumerate_partitions(
+            record.current_watermark, expected_str, record.partition_format
+        )
+        confirmed = confirmed_partitions or set()
+        return [p for p in candidates if p not in confirmed]
+
     def should_trigger_backfill(
         self,
         record: WatermarkRecord,
         backfill_threshold_days: int = 3,
+        confirmed_partitions: set[str] | None = None,
+        expected_watermark: str | None = None,
     ) -> tuple[bool, str]:
         """判断是否需要触发回刷补偿。
 
-        如果当前水位落后期望超过 backfill_threshold_days 天，返回 True。
+        依据有效进度版本计算实际缺失分区：明确已到达的分区不再计入缺口，
+        只有当实际缺失分区数达到 backfill_threshold_days 时才建议回刷，
+        且建议范围与本次进度检查实际核验出的缺口一致。
         """
         try:
-            wm_dt = datetime.strptime(record.current_watermark, record.partition_format)
+            wm_dt = datetime.strptime(
+                record.current_watermark, record.partition_format
+            )
         except ValueError:
             return False, "无法解析水位"
 
         now = datetime.now()
-        expected = self._expected_watermark(record.scheduled_time, now)
-        delay_days = (expected - wm_dt).days
+        expected_str = expected_watermark or self._expected_watermark(
+            record.scheduled_time, now
+        ).strftime(record.partition_format)
 
-        if delay_days >= backfill_threshold_days:
-            return True, f"落后 {delay_days} 天，建议回刷 {wm_dt.strftime(record.partition_format)} ~ {expected.strftime(record.partition_format)}"
+        missing = self.compute_missing_partitions(
+            record,
+            expected_watermark=expected_str,
+            confirmed_partitions=confirmed_partitions,
+        )
+
+        if len(missing) >= backfill_threshold_days:
+            return (
+                True,
+                f"实际缺失 {len(missing)} 个分区，建议回刷 "
+                f"{missing[0]} ~ {missing[-1]}",
+            )
         return False, ""
 
     # ---- 内部 ----

@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.engine.alert_matcher import AlertLevel, AlertRule
 from app.engine.backfill_plan import BackfillEngine
+from app.engine.progress_compensation import progress_engine
 from app.engine.validation_executor import CheckLevel, CheckType, QualityRule
 from app.engine.watermark_progress import WatermarkEngine, WatermarkRecord, WatermarkStatus
 from app.orchestrator import ETLOrchestrator
@@ -14,6 +15,14 @@ from app.orchestrator import ETLOrchestrator
 router = APIRouter(prefix="/api/business", tags=["业务编排"])
 
 _orchestrator = ETLOrchestrator()
+
+
+def _guard(call):
+    """把引擎/服务层的业务 ValueError 转成 409 结构化响应。"""
+    try:
+        return call()
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 # ---- 管线编排 ----
@@ -84,11 +93,14 @@ def run_quality_gate(body: dict[str, Any]) -> dict[str, Any]:
 
 @router.post("/watermark/check")
 def check_watermark(body: dict[str, Any]) -> dict[str, Any]:
-    """检查水位并判断是否需要回刷。
+    """检查分区进度并判断是否需要回刷。
 
     body:
       pipeline_id, partition_field, current_watermark, new_watermark,
-      scheduled_time (ISO), backfill_threshold (可选)
+      scheduled_time (ISO), backfill_threshold (可选),
+      confirmed_partitions (可选，本次实际核验到的分区),
+      baseline_partition (可选，起算基线/最后确认日期),
+      expected_partition (可选，期望到达分区，默认取 new_watermark)
     """
     from datetime import datetime
 
@@ -100,11 +112,177 @@ def check_watermark(body: dict[str, Any]) -> dict[str, Any]:
         status=WatermarkStatus(body.get("status", "正常")),
         partition_format=body.get("partition_format", "%Y-%m-%d"),
     )
-    return _orchestrator.check_watermark_and_backfill(
+    return _guard(lambda: _orchestrator.check_watermark_and_backfill(
         record,
         body["new_watermark"],
         backfill_threshold=body.get("backfill_threshold", 3),
-    )
+        confirmed_partitions=body.get("confirmed_partitions"),
+        baseline_partition=body.get("baseline_partition"),
+        expected_partition=body.get("expected_partition"),
+    ))
+
+
+# ---- 分区进度校验回执与补偿领取 ----
+
+@router.post("/progress/receipts")
+def register_progress_receipt(body: dict[str, Any]) -> dict[str, Any]:
+    """登记一次分区进度检查，生成下一版本的进度校验回执。
+
+    body:
+      pipeline_id, confirmed_partitions, baseline_partition (首次必传),
+      expected_partition (可选), status (可选), note (可选)
+    """
+    def _call() -> dict[str, Any]:
+        receipt = progress_engine.register_receipt(
+            pipeline_id=body["pipeline_id"],
+            confirmed_partitions=list(body.get("confirmed_partitions", [])),
+            baseline_partition=body.get("baseline_partition"),
+            expected_partition=body.get("expected_partition"),
+            check_status=body.get("status"),
+            note=body.get("note", ""),
+        )
+        return {"ok": True, "receipt": receipt.to_dict()}
+
+    return _guard(_call)
+
+
+@router.post("/progress/late-receipt")
+def register_late_receipt(body: dict[str, Any]) -> dict[str, Any]:
+    """登记迟到的本日成功回执并对在途补偿对账。
+
+    body:
+      pipeline_id, confirmed_partitions, expected_partition (可选),
+      status (可选), note (可选)
+    """
+    def _call() -> dict[str, Any]:
+        result = progress_engine.register_late_receipt(
+            pipeline_id=body["pipeline_id"],
+            confirmed_partitions=list(body.get("confirmed_partitions", [])),
+            expected_partition=body.get("expected_partition"),
+            check_status=body.get("status"),
+            note=body.get("note", ""),
+        )
+        return {"ok": True, **result}
+
+    return _guard(_call)
+
+
+@router.get("/progress/{pipeline_id}/missing")
+def get_missing_partitions(
+    pipeline_id: str, receipt_version: int | None = None
+) -> dict[str, Any]:
+    """依据有效进度版本计算管线的实际缺失分区。"""
+    def _call() -> dict[str, Any]:
+        missing = progress_engine.compute_missing_partitions(
+            pipeline_id, receipt_version=receipt_version
+        )
+        receipt = (
+            progress_engine.get_receipt(pipeline_id, receipt_version)
+            if receipt_version is not None
+            else progress_engine.latest_receipt(pipeline_id)
+        )
+        return {
+            "pipeline_id": pipeline_id,
+            "receipt_version": receipt.receipt_version if receipt else None,
+            "missing_partitions": missing,
+            "missing_count": len(missing),
+        }
+
+    return _guard(_call)
+
+
+@router.get("/progress/{pipeline_id}/compensation-range")
+def get_compensation_range(
+    pipeline_id: str, receipt_version: int | None = None
+) -> dict[str, Any]:
+    """给出与指定进度检查相符的可执行补偿范围。"""
+    return _guard(lambda: progress_engine.executable_compensation_range(
+        pipeline_id, receipt_version=receipt_version
+    ))
+
+
+@router.post("/compensation/batches")
+def create_compensation_batches(body: dict[str, Any]) -> dict[str, Any]:
+    """从可执行补偿范围创建补偿批次，记录核验回执与实际写入日期。
+
+    body:
+      pipeline_id, receipt_version (可选), partitions_per_batch (可选)
+    """
+    from app.services import service_for
+
+    def _call() -> dict[str, Any]:
+        service = service_for("rerun_compensation")
+        entries = service.create_compensation_batches(
+            body["pipeline_id"],
+            receipt_version=body.get("receipt_version"),
+            partitions_per_batch=int(body.get("partitions_per_batch", 1)),
+        )
+        rng = progress_engine.executable_compensation_range(
+            body["pipeline_id"], receipt_version=body.get("receipt_version")
+        )
+        batches = progress_engine.list_batches(body["pipeline_id"])
+        new_batches = [
+            batch.to_dict() for batch in batches
+            if batch.basis_receipt_version == rng["basis_receipt_version"]
+            and any(
+                entry.get("批次编号") == batch.batch_no for entry in entries
+            )
+        ]
+        return {
+            "ok": True,
+            "basis_receipt_version": rng["basis_receipt_version"],
+            "compensation_range": rng,
+            "batches": new_batches,
+            "rerun_entries": entries,
+        }
+
+    return _guard(_call)
+
+
+@router.post("/compensation/claims")
+def claim_compensation(body: dict[str, Any]) -> dict[str, Any]:
+    """领取一个缺失分区的补偿（并发幂等，同一日期只确认一次有效领取）。
+
+    body: pipeline_id, partition, idempotency_key (可选)
+    """
+    from app.services import service_for
+
+    def _call() -> dict[str, Any]:
+        service = service_for("rerun_compensation")
+        result = service.claim_missing_partition(
+            body["pipeline_id"],
+            body["partition"],
+            idempotency_key=body.get("idempotency_key", ""),
+        )
+        return {"ok": True, **result}
+
+    return _guard(_call)
+
+
+@router.post("/compensation/write-confirmations")
+def confirm_compensation_write(body: dict[str, Any]) -> dict[str, Any]:
+    """确认补偿分区写入；重复确认幂等，被新进度抵销的日期拒绝写入。
+
+    body: pipeline_id, partition, idempotency_key (可选)
+    """
+    from app.services import service_for
+
+    def _call() -> dict[str, Any]:
+        service = service_for("rerun_compensation")
+        result = service.confirm_partition_write(
+            body["pipeline_id"],
+            body["partition"],
+            idempotency_key=body.get("idempotency_key", ""),
+        )
+        return {"ok": True, **result}
+
+    return _guard(_call)
+
+
+@router.get("/compensation/{pipeline_id}/snapshot")
+def compensation_snapshot(pipeline_id: str) -> dict[str, Any]:
+    """查看管线进度校验与补偿队列的完整对账快照。"""
+    return _guard(lambda: progress_engine.pipeline_snapshot(pipeline_id))
 
 
 # ---- 回刷计划 ----

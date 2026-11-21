@@ -32,6 +32,7 @@ from app.engine.validation_executor import (
 from app.engine.watermark_progress import (
     WatermarkAdvanceResult, WatermarkEngine, WatermarkRecord, WatermarkStatus,
 )
+from app.engine.progress_compensation import progress_engine
 
 
 @dataclass
@@ -91,6 +92,8 @@ class ETLOrchestrator:
         self.balancer = ResourceLoadBalancer()
         self.schema_evolution = SchemaEvolutionEngine()
         self.alert = AlertMatcher()
+        # 进度校验回执与补偿领取共享进程内单例，保证检查与补偿口径一致
+        self.progress = progress_engine
 
         # 注册默认资源池
         self.balancer.register_pool(ResourcePool(
@@ -235,12 +238,41 @@ class ETLOrchestrator:
         record: WatermarkRecord,
         new_watermark: str,
         backfill_threshold: int = 3,
+        *,
+        confirmed_partitions: list[str] | None = None,
+        baseline_partition: str | None = None,
+        expected_partition: str | None = None,
     ) -> dict[str, Any]:
-        """检查水位并决定是否触发回刷。"""
+        """检查分区进度并依据有效进度版本决定补偿范围。
+
+        流程：
+        1. 推进水位、计算延迟与状态；
+        2. 登记本次进度检查回执（一个有效进度版本），依据实际核验到的
+           分区计算真实缺失分区，已到达的分区不会被计入缺口；
+        3. 给出与该次检查相符的可执行补偿范围，需要时生成回刷方案。
+        """
         advance = self.watermark.advance(record, new_watermark)
 
+        expected = expected_partition or new_watermark
+        verified = list(confirmed_partitions or [new_watermark])
+        baseline = baseline_partition or record.current_watermark
+
+        receipt = self.progress.register_receipt(
+            pipeline_id=record.pipeline_id,
+            confirmed_partitions=verified,
+            baseline_partition=baseline,
+            expected_partition=expected,
+            check_status=advance.new_status.value,
+            note=f"水位检查 {record.current_watermark} -> {new_watermark}",
+        )
+        missing = list(receipt.missing_partitions)
+
+        # 回刷判断只看本次有效进度版本确认的实际缺口，不再按固定"昨天"推断
         need_backfill, backfill_reason = self.watermark.should_trigger_backfill(
-            record, backfill_threshold,
+            record,
+            backfill_threshold,
+            confirmed_partitions=set(receipt.verified_partitions),
+            expected_watermark=expected,
         )
 
         result: dict[str, Any] = {
@@ -251,28 +283,33 @@ class ETLOrchestrator:
             "new_status": advance.new_status.value,
             "need_backfill": need_backfill,
             "backfill_reason": backfill_reason or "",
+            "receipt": receipt.to_dict(),
+            "receipt_version": receipt.receipt_version,
+            "baseline_partition": receipt.baseline_partition,
+            "expected_partition": receipt.expected_partition,
+            "verified_partitions": list(receipt.verified_partitions),
+            "missing_partitions": missing,
+            "offset_partitions": list(receipt.offset_partitions),
         }
 
-        if need_backfill:
-            try:
-                from datetime import datetime, timedelta
-                wm_dt = datetime.strptime(record.current_watermark, record.partition_format)
-                expected = datetime.now() - timedelta(days=1)
-                plan = self.backfill.plan(
-                    pipeline_id=record.pipeline_id,
-                    start_partition=record.current_watermark,
-                    end_partition=expected.strftime(record.partition_format),
-                    parallelism=4,
-                    reason=backfill_reason or "水位延迟自动触发",
-                )
-                result["backfill_plan"] = {
-                    "total_partitions": plan.total_partitions,
-                    "batch_count": len(plan.batches),
-                    "parallelism": plan.parallelism,
-                    "estimated_completion": plan.estimated_completion,
-                }
-            except ValueError:
-                result["backfill_plan"] = {"error": "无法生成回刷方案"}
+        if need_backfill and missing:
+            plan = self.backfill.plan(
+                pipeline_id=record.pipeline_id,
+                start_partition=missing[0],
+                end_partition=missing[-1],
+                parallelism=4,
+                reason=backfill_reason or "依据进度校验回执的实际缺失分区触发",
+                partition_format=record.partition_format,
+            )
+            result["backfill_plan"] = {
+                "total_partitions": plan.total_partitions,
+                "batch_count": len(plan.batches),
+                "parallelism": plan.parallelism,
+                "estimated_completion": plan.estimated_completion,
+                "basis_receipt_version": receipt.receipt_version,
+                "plan_start": missing[0],
+                "plan_end": missing[-1],
+            }
 
         return result
 

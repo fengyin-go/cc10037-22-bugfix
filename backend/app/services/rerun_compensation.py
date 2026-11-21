@@ -2,12 +2,16 @@
 
 上游：depend_scheduler 产出调度状态 → rerun_compensation 执行重跑
 消费：backfill_tracker 消费回刷进度用于追踪和数据写入量统计
+
+补偿口径与 app.engine.progress_compensation 中的进度校验回执保持一致：
+可执行补偿范围只能由有效进度版本计算，明确到达的分区不得被延迟补算覆盖。
 """
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
+from app.engine.progress_compensation import progress_engine
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -141,3 +145,107 @@ class RerunCompensationService(BaseModuleService):
         if entry:
             entry["last_operated_at"] = datetime.now().isoformat()
         return entry, msg
+
+    # ---- 进度回执驱动的补偿领域能力 ----
+
+    def executable_compensation_range(
+        self, pipeline_name: str, receipt_version: int | None = None
+    ) -> dict[str, Any]:
+        """依据有效进度版本返回与某次检查相符的可执行补偿范围。"""
+        return progress_engine.executable_compensation_range(
+            pipeline_name, receipt_version=receipt_version
+        )
+
+    def create_compensation_batches(
+        self,
+        pipeline_name: str,
+        *,
+        receipt_version: int | None = None,
+        partitions_per_batch: int = 1,
+    ) -> list[dict[str, Any]]:
+        """回刷补偿从可执行补偿范围创建批次。
+
+        批次同步记录该次实际核验的进度回执版本和会写入的日期，
+        并在 rerun_compensation 资源表中留痕。
+        """
+        batches = progress_engine.create_batches_from_range(
+            pipeline_name,
+            receipt_version=receipt_version,
+            partitions_per_batch=partitions_per_batch,
+        )
+        entries: list[dict[str, Any]] = []
+        for batch in batches:
+            entry, _missing = self.create_entry({
+                "任务名称": f"补偿批次 {batch.batch_no}",
+                "目标管线": pipeline_name,
+                "重跑范围": "日期范围",
+                "开始分区": batch.write_partitions[0],
+                "结束分区": batch.write_partitions[-1],
+                "并行度": "1",
+                "补偿原因": (
+                    f"依据进度回执v{batch.basis_receipt_version}的实际缺失分区补偿，"
+                    f"实际写入日期：{', '.join(batch.write_partitions)}"
+                ),
+            })
+            if entry is not None:
+                entry["批次编号"] = batch.batch_no
+                entry["核验回执版本"] = batch.basis_receipt_version
+                entry["实际写入日期"] = ",".join(batch.write_partitions)
+                entries.append(entry)
+        return entries
+
+    def claim_missing_partition(
+        self,
+        pipeline_name: str,
+        partition: str,
+        *,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        """领取缺失分区补偿：领取依据与最新进度回执保持一致。
+
+        本轮明确到达的日期不在缺失分区内，会被拒绝；
+        并发领取同一日期只产生一张有效领取单。
+        """
+        claim, created = progress_engine.claim_partition(
+            pipeline_name, partition, idempotency_key=idempotency_key
+        )
+        return {
+            "created": created,
+            "claim": claim.to_dict(),
+            "message": "领取成功" if created else "该分区已有在途领取单，返回既有领取单",
+        }
+
+    def confirm_partition_write(
+        self,
+        pipeline_name: str,
+        partition: str,
+        *,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        """确认补偿写入：同一日期只确认一次有效写入。"""
+        return progress_engine.confirm_partition_write(
+            pipeline_name, partition, idempotency_key=idempotency_key
+        )
+
+    def reconcile_with_late_receipt(
+        self,
+        pipeline_name: str,
+        confirmed_partitions: list[str],
+        *,
+        expected_partition: str | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """迟到成功回执到达后重新对账。
+
+        区分已被新进度抵销的日期与仍无产物的过往缺口，并解释旧建议为何缩短。
+        """
+        return progress_engine.register_late_receipt(
+            pipeline_name,
+            confirmed_partitions,
+            expected_partition=expected_partition,
+            note=note,
+        )
+
+    def compensation_snapshot(self, pipeline_name: str) -> dict[str, Any]:
+        """返回该管线进度回执、补偿队列与实际写入日期的对账快照。"""
+        return progress_engine.pipeline_snapshot(pipeline_name)
